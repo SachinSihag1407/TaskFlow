@@ -1,0 +1,47 @@
+# Render Blueprint for the free single-service demo.
+#
+# Runs `taskflow all-in-one` (migrations + API + scheduler + worker + UI) from
+# the root Dockerfile. PostgreSQL comes from an external free provider such as
+# Neon (Render's free Postgres expires); Redis is not used — workers poll
+# PostgreSQL and the UI polls for updates.
+#
+# Deploy: Render dashboard → New → Blueprint → select this repository, then
+# fill in the values marked `sync: false` when prompted.
+services:
+  - type: web
+    name: taskflow
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /readyz
+    autoDeploy: true
+    envVars:
+      # Neon DIRECT connection string (host without "-pooler"), e.g.
+      # postgres://user:pass@ep-xxx.region.aws.neon.tech/neondb?sslmode=require
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        value: disabled
+      - key: DB_MAX_CONNS
+        value: "5"
+      - key: WORKER_CONCURRENCY
+        value: "2"
+      # Public demo: no outbound webhooks, so visitors cannot use the demo to
+      # send requests to third-party sites. All other handlers stay available.
+      - key: ENABLED_HANDLERS
+        value: report.generate,batch.process,notification.send,test.sleep
+      # No demo accounts are created: visitors sign up and get their own
+      # private workspace. Set SEED_DEMO=true plus SEED_PASSWORD only if you
+      # want pre-filled demo data under admin@example.com.
+      - key: SEED_DEMO
+        value: "false"
+      # The email you will register with; lets you drain workers from the UI.
+      - key: PLATFORM_ADMIN_EMAILS
+        sync: false
+      - key: ALLOW_REGISTRATION
+        value: "true"
+      - key: RATE_LIMIT_REGISTER_PER_HOUR
+        value: "10"
+      - key: METRICS_TOKEN
+        generateValue: true

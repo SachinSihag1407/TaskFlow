@@ -1,0 +1,143 @@
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Design tokens. Values are RGB channels so Tailwind can apply opacity.
+ * Palette: restrained neutrals, one accent (iris), semantic status colours.
+ * Status colours have three roles: text (DEFAULT), soft background, solid fill.
+ */
+:root {
+  --canvas: 247 247 248;
+  --surface: 255 255 255;
+  --surface-2: 243 243 245;
+  --surface-3: 235 235 239;
+  --line: 228 228 232;
+  --line-strong: 210 210 217;
+
+  --fg: 24 24 27;
+  --fg-muted: 82 82 91;
+  --fg-subtle: 113 113 122;
+  --fg-faint: 161 161 170;
+
+  --accent: 62 99 221;
+  --accent-hover: 51 88 212;
+  --accent-fg: 255 255 255;
+  --accent-soft: 237 242 254;
+  --accent-soft-fg: 58 91 199;
+
+  --success: 33 131 88;
+  --success-soft: 230 246 235;
+  --success-solid: 48 164 108;
+  --danger: 206 44 49;
+  --danger-soft: 254 235 236;
+  --danger-solid: 229 72 77;
+  --warning: 171 100 0;
+  --warning-soft: 255 247 213;
+  --warning-solid: 255 178 36;
+  --info: 13 116 206;
+  --info-soft: 230 244 254;
+  --info-solid: 0 144 255;
+
+  /* Chart status pair, validated for deuteranopia/protanopia separation
+     (dataviz validator: CVD ΔE 17.1, normal 33.7). Low surface contrast is
+     relieved by a legend with totals and a table view. */
+  --chart-success: 86 186 138;
+  --chart-danger: 198 42 47;
+  --chart-grid: 228 228 232;
+
+  color-scheme: light;
+}
+
+.dark {
+  --canvas: 10 10 12;
+  --surface: 17 17 19;
+  --surface-2: 25 25 28;
+  --surface-3: 33 33 37;
+  --line: 38 38 43;
+  --line-strong: 52 52 58;
+
+  --fg: 237 237 239;
+  --fg-muted: 166 166 176;
+  --fg-subtle: 124 124 135;
+  --fg-faint: 85 85 94;
+
+  --accent: 84 114 228;
+  --accent-hover: 107 133 235;
+  --accent-fg: 255 255 255;
+  --accent-soft: 24 36 73;
+  --accent-soft-fg: 158 177 255;
+
+  --success: 61 214 140;
+  --success-soft: 19 45 33;
+  --success-solid: 41 163 109;
+  --danger: 255 149 146;
+  --danger-soft: 59 18 25;
+  --danger-solid: 229 72 77;
+  --warning: 255 202 22;
+  --warning-soft: 48 32 8;
+  --warning-solid: 255 178 36;
+  --info: 112 184 255;
+  --info-soft: 13 40 71;
+  --info-solid: 0 144 255;
+
+  /* Dark-mode pair validated against #111113 (CVD ΔE 16.0). */
+  --chart-success: 46 168 111;
+  --chart-danger: 168 38 44;
+  --chart-grid: 38 38 43;
+
+  color-scheme: dark;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+  }
+  body {
+    @apply bg-canvas font-sans text-base text-fg antialiased;
+    font-feature-settings: "cv11", "ss01";
+  }
+  *,
+  *::before,
+  *::after {
+    @apply border-line;
+  }
+  /* One consistent, clearly visible focus ring for keyboard users. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-accent/60 ring-offset-1 ring-offset-canvas;
+  }
+  ::selection {
+    @apply bg-accent/25;
+  }
+  code,
+  kbd,
+  pre {
+    @apply font-mono;
+  }
+}
+
+@layer utilities {
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--line-strong)) transparent;
+  }
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    transition-duration: 1ms !important;
+  }
+}

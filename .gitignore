@@ -1,0 +1,11 @@
+.env
+*.local
+node_modules/
+frontend/dist/
+frontend/playwright-report/
+frontend/test-results/
+backend/taskflow
+backend/coverage.*
+*.log
+.DS_Store
+backend/bin/

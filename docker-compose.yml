@@ -1,0 +1,155 @@
+# TaskFlow local stack.
+#
+#   cp .env.example .env        # then set the secrets in .env
+#   docker compose up -d --build
+#   docker compose run --rm seed   # optional demo data
+#   open http://localhost:8080
+#
+# Scale workers:  docker compose up -d --scale worker=4
+
+name: taskflow
+
+x-backend: &backend
+  build:
+    context: ./backend
+    args:
+      VERSION: ${TASKFLOW_VERSION:-dev}
+  image: taskflow-backend:${TASKFLOW_VERSION:-dev}
+  restart: unless-stopped
+  environment: &backend-env
+    TASKFLOW_ENV: ${TASKFLOW_ENV:-development}
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    DATABASE_URL: postgres://${POSTGRES_USER:-taskflow}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-taskflow}?sslmode=disable
+    REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
+    WEBHOOK_ALLOW_PRIVATE_NETWORKS: "false"
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
+  read_only: true
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+
+services:
+  postgres: 
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-taskflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-taskflow}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    # AOF persistence; Redis is still not the source of truth (see docs).
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}"]
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+
+  migrate:
+    <<: *backend
+    command: ["migrate"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *backend
+    command: ["api"]
+    environment:
+      <<: *backend-env
+      HTTP_ADDR: ":8080"
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:8080}
+      ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-true}
+      RATE_LIMIT_REGISTER_PER_HOUR: ${RATE_LIMIT_REGISTER_PER_HOUR:-5}
+      PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS:-}
+      TRUST_PROXY_HEADERS: "true" # only nginx can reach the API port
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "/taskflow", "healthcheck", "http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+      start_period: 10s
+    ports:
+      - "127.0.0.1:${API_PORT:-8081}:8080"
+    stop_grace_period: 25s
+
+  scheduler:
+    <<: *backend
+    command: ["scheduler"]
+    environment:
+      <<: *backend-env
+      ADMIN_ADDR: ":9090"
+    healthcheck:
+      test: ["CMD", "/taskflow", "healthcheck", "http://127.0.0.1:9090/readyz"]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+    stop_grace_period: 10s
+
+  worker:
+    <<: *backend
+    command: ["worker"]
+    deploy:
+      replicas: 2
+    environment:
+      <<: *backend-env
+      ADMIN_ADDR: ":9090"
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      SHUTDOWN_GRACE: ${WORKER_SHUTDOWN_GRACE:-30s}
+    healthcheck:
+      test: ["CMD", "/taskflow", "healthcheck", "http://127.0.0.1:9090/readyz"]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+    # Must exceed SHUTDOWN_GRACE so in-flight attempts can finish on SIGTERM.
+    stop_grace_period: 45s
+
+  web:
+    build: ./frontend
+    image: taskflow-web:${TASKFLOW_VERSION:-dev}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+
+  # One-shot demo data: docker compose run --rm seed
+  seed:
+    <<: *backend
+    command: ["seed"]
+    restart: "no"
+    profiles: ["tools"]
+    environment:
+      <<: *backend-env
+      SEED_PASSWORD: ${SEED_PASSWORD:-}
+
+volumes:
+  pgdata:
+  redisdata:
