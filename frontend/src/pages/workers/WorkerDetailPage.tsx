@@ -172,9 +172,9 @@ export default function WorkerDetailPage() {
                     </span>
                   ),
                 },
-                { label: "Heap memory", value: live ? formatBytes(w.heap_alloc_bytes) : "—" },
+                { label: "Memory (RSS)", value: live ? formatBytes(w.heap_alloc_bytes) : "—" },
                 {
-                  label: "Goroutines",
+                  label: "Async tasks",
                   value: live && w.goroutines != null ? formatNumber(w.goroutines) : "—",
                 },
                 { label: "Process", value: `pid ${w.pid} · ${w.version}` },

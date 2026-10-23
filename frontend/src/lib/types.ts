@@ -1,4 +1,4 @@
-// Types mirror the Go API's JSON (see backend/internal/api/openapi.yaml).
+// Types mirror the API's JSON (see /api/openapi.json, served by the FastAPI backend).
 
 export type JobStatus =
   | "CREATED"

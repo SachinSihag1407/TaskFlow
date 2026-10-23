@@ -1,21 +1,22 @@
-# syntax=docker/dockerfile:1.7
 # One image for every backend process: api, scheduler, worker, migrate, seed.
+# No BuildKit-only syntax, so any Docker builder works.
 
-FROM golang:1.26-alpine AS build
-WORKDIR /src
-ENV CGO_ENABLED=0 GOFLAGS=-trimpath
-COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
-COPY . .
-ARG VERSION=dev
-RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    go build -ldflags="-s -w -X main.version=${VERSION}" -o /out/taskflow ./cmd/taskflow
+FROM python:3.12-slim AS build
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+COPY requirements.txt /tmp/requirements.txt
+RUN python -m venv /venv && /venv/bin/pip install -r /tmp/requirements.txt
+COPY taskflow /app/taskflow
+RUN /venv/bin/python -m compileall -q /app/taskflow
 
-# Distroless: no shell or package manager, runs as an unprivileged user.
-# The IANA timezone database is embedded in the binary (time/tzdata).
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/taskflow /taskflow
-USER nonroot:nonroot
+# Runtime: no build tools, unprivileged user, read-only friendly (no .pyc
+# writes at runtime; bytecode is compiled above).
+FROM python:3.12-slim
+RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin taskflow
+COPY --from=build /venv /venv
+COPY --from=build /app /app
+WORKDIR /app
+ENV PATH=/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+USER 10001
 EXPOSE 8080 9090
-ENTRYPOINT ["/taskflow"]
+ENTRYPOINT ["python", "-m", "taskflow"]
 CMD ["api"]

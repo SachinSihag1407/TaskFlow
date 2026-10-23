@@ -5,7 +5,7 @@ This document explains how TaskFlow is put together and why. It assumes you have
 ## Design principles
 
 1. **PostgreSQL is the only source of truth.** Every fact that matters — what is due, who is running what, what succeeded — is a row changed inside a transaction. Redis holds hints that can be rebuilt.
-2. **Every state change goes through one place.** `internal/engine` implements all lifecycle operations; `internal/statemachine` decides which transitions are legal. No other code writes a status.
+2. **Every state change goes through one place.** `taskflow/engine.py` implements all lifecycle operations; `taskflow/statemachine.py` decides which transitions are legal. No other code writes a status.
 3. **Assume crashes everywhere.** Any process can die between any two lines. Each operation is either a single transaction or safe to repeat, and side effects outside PostgreSQL happen after commit and are reconciled.
 4. **At-least-once, made safe by idempotency.** Exactly-once execution is impossible across a network boundary; duplicates are prevented where they can be (claims, occurrences, replays) and made harmless where they cannot (handlers).
 
@@ -38,40 +38,40 @@ sequenceDiagram
   R-->>A: event → SSE → browser re-fetches
 ```
 
-### API server (`internal/api`, `internal/service`)
+### API server (`taskflow/api`, `taskflow/services`)
 
-Stateless HTTP server on Go's `net/http` mux. Middleware order: request id / panic recovery / access log / metrics / security headers → CORS → Origin check → session authentication → per-route auth, CSRF, role and rate-limit wrappers. Handlers decode strictly, call a service and map domain errors to HTTP (`422` validation with per-field messages, `409` conflicts with a reason, `404` for anything outside the caller's workspace).
+Stateless FastAPI application served by uvicorn. One plain-ASGI middleware handles request id, panic recovery, access log, metrics, security headers, CORS, the Origin check and body-size limits (plain ASGI so SSE streams pass through untouched); per-route dependencies handle session authentication, CSRF, roles and rate limits. Request bodies are parsed by Pydantic in strict JSON mode with unknown fields forbidden. Handlers decode strictly, call a service and map domain errors to HTTP (`422` validation with per-field messages, `409` conflicts with a reason, `404` for anything outside the caller's workspace).
 
 The SSE hub keeps **one** Redis subscription per API process and fans events out to connected browsers, filtered by workspace. Events contain identifiers only; the browser invalidates the matching React Query caches and re-fetches through authorised endpoints. If Redis is unreachable the hub tells clients (`event: status {"live":false}`) and the UI switches to 5-second polling.
 
-### Engine (`internal/engine`)
+### Engine (`taskflow/engine.py`)
 
 All writes to jobs and runs:
 
 | Operation | Called by | Essence |
 |---|---|---|
-| `ScheduleDue` | scheduler | lock due jobs, plan occurrences (missed-run + overlap policy), insert runs idempotently, advance `next_run_at`, derive status |
-| `PromoteRetries` | scheduler | `RETRY_WAIT → QUEUED` for runs whose backoff elapsed |
-| `RecoverExpiredLeases` | scheduler | attempt `LOST`; run → `RETRY_WAIT` / `FAILED` / `CANCELLED` |
-| `Reconcile` | scheduler | re-publish QUEUED runs missing from Redis (`ZADD NX`) |
-| `Claim` / `ClaimNext` | workers | atomic `QUEUED → RUNNING` with concurrency limits; `ClaimNext` is the Redis-free path |
-| `RenewLease`, `SaveCheckpoint` | workers | fenced by `current_attempt_id` |
-| `Complete` | workers | fenced; decides success / retry with backoff / dead-letter / cancelled |
-| `CancelJob`, `CancelRun`, `PauseJob`, `ResumeJob`, `RetryJob`, `ReplayRun`, `RunNow` | API | validated by `statemachine.JobActions`, audited in the same transaction |
+| `schedule_due` | scheduler | lock due jobs, plan occurrences (missed-run + overlap policy), insert runs idempotently, advance `next_run_at`, derive status |
+| `promote_retries` | scheduler | `RETRY_WAIT → QUEUED` for runs whose backoff elapsed |
+| `recover_expired_leases` | scheduler | attempt `LOST`; run → `RETRY_WAIT` / `FAILED` / `CANCELLED` |
+| `reconcile` | scheduler | re-publish QUEUED runs missing from Redis (`ZADD NX`) |
+| `claim` / `claim_next` | workers | atomic `QUEUED → RUNNING` with concurrency limits; `claim_next` is the Redis-free path |
+| `renew_lease`, `save_checkpoint` | workers | fenced by `current_attempt_id` |
+| `complete` | workers | fenced; decides success / retry with backoff / dead-letter / cancelled |
+| `cancel_job`, `cancel_run`, `pause_job`, `resume_job`, `retry_job`, `replay_run`, `run_now` | API | validated by `statemachine.job_actions`, audited in the same transaction |
 
-Each operation collects post-commit *effects* (publish run ids, publish events, send cancel signals) and flushes them after the transaction commits. If flushing fails, nothing is lost: the reconciler and the workers' PostgreSQL fallback cover it.
+Each operation collects post-commit *effects* (publish run ids, publish events, send cancel signals) and flushes them after the transaction commits. Operational events are written inside a savepoint, so a failure to record one can never abort the business transaction. If flushing fails, nothing is lost: the reconciler and the workers' PostgreSQL fallback cover it.
 
 ### Locking discipline
 
 - **Lock order is always job row → run rows.** The scheduler, workers and API actions all follow it, so they cannot deadlock each other. (An early version promoted retries by locking runs first; it was rewritten to respect the order.)
 - Job rows are locked with `FOR NO KEY UPDATE`, which does not conflict with the `KEY SHARE` locks taken by foreign-key checks when runs are inserted.
 - Schedulers use `SKIP LOCKED` on due jobs so several instances (or a scheduler racing an edit) never block each other.
-- Claims take a *blocking* lock on the run row after the job lock. `SKIP LOCKED` there was a bug: an unrelated short-lived lock (the post-publish `MarkPublished` update) made a claimable run look stale.
+- Claims take a *blocking* lock on the run row after the job lock. `SKIP LOCKED` there was a bug: an unrelated short-lived lock (the post-publish `mark_published` update) made a claimable run look stale.
 - Workspace concurrency limits use a transaction-scoped advisory lock per tenant, taken only when a limit is configured.
 
-### Scheduler (`internal/scheduler`)
+### Scheduler (`taskflow/scheduler.py`)
 
-One process may run several replicas. Leadership is `pg_try_advisory_lock` held on a dedicated pooled connection; it is verified every tick with a ping, and released explicitly on shutdown or implicitly when the session dies. Leader loops:
+Several replicas may run. Leadership is `pg_try_advisory_lock` held on a dedicated connection outside the pool; it is verified every tick with a ping, and released explicitly on shutdown or implicitly when the session dies. Leader loops:
 
 | Loop | Interval |
 |---|---|
@@ -85,29 +85,28 @@ One process may run several replicas. Leadership is `pg_try_advisory_lock` held 
 
 None of these depend on mutual exclusion for correctness — leadership only avoids duplicate work.
 
-### Workers (`internal/worker`)
+### Workers (`taskflow/worker.py`)
 
-A worker registers itself, heartbeats every 5 s (status, active runs, heap and goroutine counts), and runs a claim loop bounded by a semaphore of size `WORKER_CONCURRENCY`:
+A worker registers itself, heartbeats every 5 s (status, active runs, resident memory and asyncio task count), and runs `WORKER_CONCURRENCY` slot loops; each slot claims and executes one attempt at a time, so claims of different slots overlap while the in-flight bound stays exact:
 
-1. Pop the best run id from Redis (`BZPOPMIN`, 1 s). On a Redis error, switch to `ClaimNext` against PostgreSQL and probe Redis every 5 s.
-2. Claim it. `ErrStale` (claimed elsewhere / duplicate entry) → drop; `ErrDeferred` (concurrency limit) or unsupported handler → park in the delayed set for 1–2 s; `ErrPaused` → drop (resume re-publishes).
-3. Execute in a goroutine with a context that carries a *cause*: operator cancel, timeout, shutdown or lease loss. A companion goroutine renews the lease every `lease/3`, flushes attempt logs every second and turns a cancellation flag into context cancellation. A Redis pub/sub listener makes cancellation near-instant; lease renewal is the guaranteed path.
-4. Classify the result from the error and the context cause, and `Complete` with retries for up to one lease duration on database errors.
+1. Pop the best run id from Redis (`BZPOPMIN`, 1 s). On a Redis error, switch to `claim_next` against PostgreSQL and probe Redis every 5 s.
+2. Claim it. `Stale` (claimed elsewhere / duplicate entry) → drop; `Deferred` (concurrency limit) or `Unsupported` handler → park in the delayed set for 1–2 s; `Paused` → drop (resume re-publishes).
+3. Execute the handler in its own asyncio task and record a *cause* when stopping it: operator cancel, timeout, shutdown or lease loss. A companion task renews the lease every `lease/3`, flushes attempt logs every second and turns a cancellation flag into task cancellation. A Redis pub/sub listener makes cancellation near-instant; lease renewal is the guaranteed path.
+4. Classify the result from the exception and the stop cause, and `complete` with retries for up to one lease duration on database errors.
 
-Panics in handlers are recovered and recorded with a stack excerpt; the worker keeps serving other runs.
+Unexpected exceptions in handlers ("panics") are caught and recorded with a traceback excerpt; the worker keeps serving other runs.
 
-### Handlers (`internal/handlers`)
+### Handlers (`taskflow/handlers`)
 
-```go
-type Handler interface {
-    Name() string
-    Info() Info                                   // title, description, fields, example payload, idempotency notes
-    Validate(payload json.RawMessage) error       // used by the API on create/update and by the worker before running
-    Execute(ctx context.Context, x *Execution) (json.RawMessage, error)
-}
+```python
+class Handler:
+    name: str                                    # stable id stored on jobs, e.g. "report.generate"
+    def info(self) -> dict: ...                  # title, description, fields, example payload, idempotency notes
+    def validate(self, payload) -> None: ...     # used by the API on create/update and by the worker before running
+    async def execute(self, x: Execution): ...   # returns the run's JSON result
 ```
 
-`Execution` provides the run/attempt ids, attempt number, payload, saved checkpoint, a stable `IdempotencyKey`, a redacting logger and `SaveCheckpoint`. Returning `handlers.Permanent(err)` skips retries. Adding a job type means implementing this interface and registering it in `handlers.Builtin`.
+`Execution` provides the run/attempt ids, attempt number, payload, saved checkpoint, a stable `idempotency_key`, a redacting logger and `save_checkpoint`. Raising `HandlerError` means a retryable failure, `Permanent` skips retries, and cancellation arrives as `asyncio.CancelledError`. Adding a job type means subclassing `Handler` and registering it in `handlers.builtin`.
 
 | Handler | Idempotency strategy |
 |---|---|
@@ -120,7 +119,7 @@ type Handler interface {
 ## Scheduling semantics
 
 - **Evaluation:** cron fields are evaluated in the job's IANA timezone; all stored times are UTC.
-- **DST** (`internal/schedule`): fixed-hour expressions use wall-clock semantics — a time skipped by spring-forward runs at the equivalent instant after the jump; a time repeated by fall-back runs once. Expressions that fire every hour follow real elapsed time (they run during both passes of a repeated hour). This matches Vixie cron/cronie and is covered by tests for America/New_York transitions.
+- **DST** (`taskflow/cron.py`): fixed-hour expressions use wall-clock semantics — a time skipped by spring-forward runs at the equivalent instant after the jump; a time repeated by fall-back runs once. Expressions that fire every hour follow real elapsed time (they run during both passes of a repeated hour). This matches Vixie cron/cronie and is covered by tests for America/New_York transitions.
 - **Missed runs:** occurrences more than 60 s late are "missed". `skip` drops them, `run_once` coalesces all due occurrences into one run, `run_all` runs each (capped at 50, newest kept). Pausing a job and resuming later is handled by the same policy.
 - **Overlap:** `skip` drops an occurrence while a run is active (and records an event), `queue` enqueues it but limits the job to one running attempt, `allow` runs up to `max_concurrency` at once.
 - **One-time jobs** run late rather than being skipped.
@@ -135,7 +134,7 @@ type Handler interface {
 
 ## Observability
 
-- **Logs:** JSON (`log/slog`) with component, request id, user id, route, status and duration; worker logs carry run id, attempt and handler.
+- **Logs:** JSON (stdlib `logging` with a JSON formatter) with component, request id, user id, route, status and duration; worker logs carry run id, attempt and handler.
 - **Metrics** (Prometheus): HTTP rate/latency by route pattern; runs enqueued by trigger; occurrences skipped by reason; attempts finished by handler/status; attempt duration and queue wait histograms; claim outcomes by source (redis/db); leases recovered; results discarded after lease loss; reconciler re-publishes; Redis errors by operation; worker active runs/capacity; queue depth by source; scheduler tick duration and leadership; SSE clients.
 - **Health:** `/healthz` (liveness) and `/readyz` (PostgreSQL reachable) on every process; the API's `/api/v1/system/health` aggregates dependencies, scheduler leadership, worker availability, queue depth and error/retry rates for the UI.
 

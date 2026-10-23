@@ -1,8 +1,11 @@
 **/node_modules
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/.venv
 frontend/dist
 frontend/playwright-report
 frontend/test-results
-backend/bin
 .git
 .env
 docs/images

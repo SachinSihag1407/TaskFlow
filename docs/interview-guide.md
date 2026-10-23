@@ -10,7 +10,7 @@ Short, defensible answers to the questions this project invites, with pointers i
 
 **Redis** makes dispatch fast and cheap: workers block on a priority ZSET (`BZPOPMIN`) instead of N workers polling PostgreSQL; pub/sub pushes lifecycle events to the API for SSE and delivers cancellation signals instantly; it stores shared rate-limit counters.
 
-The key decision is that **Redis is never trusted**. A Redis entry is only a hint that a run *might* be claimable; the claim itself is a PostgreSQL transaction. So duplicate entries fail to claim, stale entries are dropped, and lost entries are re-published by the reconciler (`engine.Reconcile`). With Redis completely down, workers claim directly from PostgreSQL (`engine.ClaimNext`) — tested in `TestRedisOutageFallsBackToPostgres` and the `redis` failure drill.
+The key decision is that **Redis is never trusted**. A Redis entry is only a hint that a run *might* be claimable; the claim itself is a PostgreSQL transaction. So duplicate entries fail to claim, stale entries are dropped, and lost entries are re-published by the reconciler (`Engine.reconcile`). With Redis completely down, workers claim directly from PostgreSQL (`Engine.claim_next`) — tested in `test_redis_outage_falls_back_to_postgres` and the `redis` failure drill.
 
 *Trade-off:* PostgreSQL is the throughput ceiling — every claim and completion is a ~10–15 statement transaction. A PostgreSQL-only design (just `SKIP LOCKED` polling) would also work at this scale; Redis buys latency and lower DB load, at the cost of a reconciliation path.
 
@@ -22,7 +22,7 @@ They never coordinate with each other — they coordinate through PostgreSQL:
 2. `engine.Claim` opens a transaction, locks the **job** row, then the **run** row, checks `status = 'QUEUED'`, checks per-job and per-workspace concurrency limits, inserts an attempt and sets `status = 'RUNNING'`, `current_attempt_id`, `worker_id` and `lease_expires_at`.
 3. A second worker trying the same run blocks on the lock, then sees `RUNNING` and drops the entry.
 
-`TestConcurrentClaimsSucceedExactlyOnce` fires 25 concurrent claims at one run and asserts exactly one attempt row.
+`test_exactly_one_concurrent_claim_wins` fires 10 concurrent claims at one run and asserts exactly one succeeds.
 
 *Follow-up — why lock the job row?* Concurrency limits ("at most 2 runs of this job at once") are a check-then-act across rows; holding the job lock makes the count and the insert atomic. A fixed lock order (job → run) everywhere prevents deadlocks.
 
@@ -65,18 +65,18 @@ Each cron job stores `next_run_at`. Every second, the leader scheduler:
 4. advances `next_run_at` and derives the job status, all in one transaction;
 5. after commit, publishes the new runs to Redis.
 
-If the scheduler crashes after commit but before publishing, the reconciler publishes later. If it crashes before commit, nothing happened and the next tick redoes it. If two schedulers race, the unique index makes the second insert a no-op. `TestConcurrentSchedulersDoNotDuplicateOccurrences` runs 8 schedulers concurrently over 50 due occurrences and expects exactly 50 runs.
+If the scheduler crashes after commit but before publishing, the reconciler publishes later. If it crashes before commit, nothing happened and the next tick redoes it. If two schedulers race, the unique index makes the second insert a no-op. `test_concurrent_schedulers_do_not_duplicate_occurrences` runs 5 schedulers concurrently over 4 due occurrences and expects exactly 4 runs.
 
 Leadership (a PostgreSQL session advisory lock) only avoids wasted work; correctness doesn't depend on it.
 
 ### 7. Timezones and daylight saving?
 
-Timestamps are UTC everywhere; cron fields are evaluated in the job's IANA zone. For DST I chose cronie's semantics, implemented in `internal/schedule`:
+Timestamps are UTC everywhere; cron fields are evaluated in the job's IANA zone. For DST I chose cronie's semantics, implemented in `backend/taskflow/cron.py` (a small, readable evaluator written for this project):
 
 - fixed-hour schedules use wall-clock time: `30 2 * * *` in New York runs at 03:30 on the spring-forward day (02:30 doesn't exist) and only once on the fall-back day (01:30 happens twice);
 - schedules that fire every hour follow real elapsed time.
 
-The cron library's default would have *skipped* the spring-forward run and *doubled* the fall-back run — I found that by probing it before writing the tests (`TestDSTSpringForwardFixedTimeShiftsForward`, `TestDSTFallBackFixedTimeRunsOnce`).
+The cron library's default would have *skipped* the spring-forward run and *doubled* the fall-back run — I found that by probing it before writing the tests (`test_dst_spring_forward_fixed_time_shifts_forward`, `test_dst_fall_back_fixed_time_runs_once`).
 
 ### 8. How do retries work?
 
@@ -100,13 +100,13 @@ URL checks at save time (scheme, no credentials, port policy, no `localhost`/`*.
 
 ### 12. How did you verify it, beyond "it compiles"?
 
-- Race-enabled integration tests against real PostgreSQL and Redis for the concurrency claims (concurrent claims, schedulers, cancel/complete races, replay races).
-- Worker tests that run real worker goroutines through crashes, Redis outages, timeouts, panics, shutdown and drain.
+- Integration tests against real PostgreSQL and Redis for the concurrency claims (concurrent claims, schedulers, cancel/complete races, replay races).
+- Worker tests that run a real asyncio worker through crashes, Redis outages, timeouts, handler crashes, shutdown and drain.
 - Playwright E2E against both the dev server and the Docker Compose production build, including responsive checks at 375/768/1366 px.
 - Failure drills against the container stack (SIGKILL a busy worker, stop Redis, restart the scheduler).
 - A load test that measures from stored execution records.
 
-Several real bugs came out of this (listed in [failure-scenarios.md](failure-scenarios.md#found-by-testing)) — the best story is the load test: utilisation was only 33% while the queue was full. Sampling the pipeline showed a few runs stuck in `QUEUED` until the reconciler rescued them. Cause: the claim used `SKIP LOCKED` on the run row, and a post-publish bookkeeping UPDATE briefly locked it, so the claim misread a claimable run as stale. Switching to a blocking lock (safe because the job lock already serialises claims) raised throughput from 37.8 to 57.2 jobs/s with identical parameters.
+Several real bugs came out of this (listed in [failure-scenarios.md](failure-scenarios.md#found-by-testing)) — the best story is the load test: utilisation was only 33% while the queue was full. Sampling the pipeline showed a few runs stuck in `QUEUED` until the reconciler rescued them. Cause: the claim used `SKIP LOCKED` on the run row, and a post-publish bookkeeping UPDATE briefly locked it, so the claim misread a claimable run as stale. Switching to a blocking lock (safe because the job lock already serialises claims) raised throughput from 37.8 to 57.2 jobs/s with identical parameters. Porting the backend to Python produced a second story of the same kind: one worker reached 27.5 jobs/s and two only 31.9, because each worker claimed runs through a single sequential loop and a claim takes ~30 ms under load. One claim loop per execution slot (same concurrency bound, now pinned by a test) took two workers to 50.9 jobs/s.
 
 ### 13. What would you change for 100× scale?
 
@@ -129,14 +129,12 @@ Several real bugs came out of this (listed in [failure-scenarios.md](failure-sce
 
 | Topic | File |
 |---|---|
-| Transition table, status derivation, action rules | `backend/internal/statemachine/statemachine.go` |
-| Claim, complete, fencing | `backend/internal/engine/execution.go` |
-| Scheduling, retries, lease recovery, reconcile | `backend/internal/engine/dispatch.go` |
-| Cancel / pause / replay / run-now | `backend/internal/engine/actions.go` |
-| Cron, timezones, DST, missed runs | `backend/internal/schedule/schedule.go` |
-| Worker runtime (leases, cancellation, shutdown) | `backend/internal/worker/worker.go` |
-| Scheduler leadership and loops | `backend/internal/scheduler/scheduler.go` |
-| Redis queue and Lua promotion | `backend/internal/queue/queue.go` |
-| SSRF guard | `backend/internal/netguard/netguard.go` |
-| Schema | `backend/internal/db/migrations/0001_init.sql` |
-| Concurrency tests | `backend/internal/engine/engine_integration_test.go`, `backend/internal/worker/worker_integration_test.go` |
+| Transition table, status derivation, action rules | `backend/taskflow/statemachine.py` |
+| Claim, complete, fencing; scheduling, retries, lease recovery, reconcile; cancel / pause / replay / run-now | `backend/taskflow/engine.py` |
+| Cron, timezones, DST, missed runs | `backend/taskflow/cron.py` |
+| Worker runtime (leases, cancellation, shutdown) | `backend/taskflow/worker.py` |
+| Scheduler leadership and loops | `backend/taskflow/scheduler.py` |
+| Redis queue and Lua promotion | `backend/taskflow/queue.py` |
+| SSRF guard | `backend/taskflow/netguard.py` |
+| Schema | `backend/taskflow/migrations/0001_init.sql` |
+| Concurrency tests | `backend/tests/test_engine.py`, `backend/tests/test_worker.py` |

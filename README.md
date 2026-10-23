@@ -2,7 +2,7 @@
 
 TaskFlow schedules, dispatches, executes, retries and monitors background jobs across multiple worker processes. It is built to show how a job system behaves when things go wrong: workers crash mid-job, Redis disappears, schedulers restart, and operators cancel work that is already running.
 
-**Stack:** Go · PostgreSQL · Redis · React + TypeScript + Vite + Tailwind · Docker Compose · Prometheus · Playwright · GitHub Actions
+**Stack:** Python 3.12 (FastAPI, asyncio, psycopg 3) · PostgreSQL · Redis · React + TypeScript + Vite + Tailwind · Docker Compose · Prometheus · Playwright · GitHub Actions
 
 ![Overview dashboard](docs/images/overview-light.png)
 
@@ -52,7 +52,7 @@ flowchart LR
     UI[React dashboard]
   end
   UI -- HTTPS / same origin --> NG[nginx<br/>static SPA + /api proxy]
-  NG -- REST + SSE --> API[API server<br/>Go]
+  NG -- REST + SSE --> API[API server<br/>Python · FastAPI]
   API -- SQL --> PG[(PostgreSQL<br/>source of truth)]
   API -- pub/sub subscribe,<br/>rate limits --> RD[(Redis<br/>queue + pub/sub)]
   SCH[Scheduler<br/>leader via advisory lock] -- enqueue occurrences,<br/>promote retries, reap leases,<br/>reconcile --> PG
@@ -76,7 +76,7 @@ The full design — data flow, locking discipline, why each piece exists — is 
 
 ## Job lifecycle
 
-A **job** is a definition (what, when, how to retry). Each occurrence of a job is a **run**; each execution of a run is an **attempt**. Runs follow a strict state machine (`backend/internal/statemachine`); a job's status is *derived* from its runs inside the same transaction.
+A **job** is a definition (what, when, how to retry). Each occurrence of a job is a **run**; each execution of a run is an **attempt**. Runs follow a strict state machine (`backend/taskflow/statemachine.py`); a job's status is *derived* from its runs inside the same transaction.
 
 ```mermaid
 stateDiagram-v2
@@ -103,7 +103,7 @@ Run transitions allowed by the table (everything else is rejected): `QUEUED→RU
 
 | Guarantee | How |
 |---|---|
-| A run is **claimed by at most one worker at a time** | Claim = job row lock + conditional `UPDATE … WHERE status='QUEUED'` in one transaction. Tested with 25 concurrent claimers. |
+| A run is **claimed by at most one worker at a time** | Claim = job row lock + conditional `UPDATE … WHERE status='QUEUED'` in one transaction. Tested with 10 concurrent claimers. |
 | A worker that **lost its lease cannot overwrite** a newer attempt | Every renew/checkpoint/complete is conditioned on `current_attempt_id` (a fencing token). |
 | A scheduled occurrence is **enqueued at most once** | Unique index on `(job_id, scheduled_for)`; concurrent schedulers + restarts tested. |
 | Concurrency limits are **never exceeded** | Per-job limit checked under the job lock; workspace limit under a per-tenant advisory lock. |
@@ -118,7 +118,7 @@ The precise failure windows (e.g. "work done, result not yet recorded") are list
 
 - **Backoff:** delay after failed attempt *n* = `min(max, base·2ⁿ⁻¹)`, with *equal jitter* (half fixed, half random) so mass failures don't retry in lockstep while a minimum backoff is still guaranteed.
 - **Permanent errors** (invalid payload, HTTP 4xx except 408/425/429, blocked destination) skip retries and dead-letter immediately.
-- **Timeouts** cancel the handler's context; the attempt is recorded `TIMED_OUT` and retried.
+- **Timeouts** cancel the handler's task; the attempt is recorded `TIMED_OUT` and retried.
 - **Worker crash:** leases (default 30s) are renewed every 10s. If a worker stops renewing, the scheduler marks the attempt `LOST` and retries or dead-letters the run. Reproduce it: `scripts/failure-drills.sh crash`.
 - **Graceful shutdown:** on SIGTERM a worker stops claiming, reports `DRAINING`, lets attempts finish for `SHUTDOWN_GRACE`, then interrupts the rest (retried promptly elsewhere) and reports `OFFLINE`. Operators can also drain a worker from the UI.
 - **Dead-letter queue:** failed runs can be inspected (failure reason, full attempt history, payload snapshot) and replayed once, with confirmation and an audit record.
@@ -141,7 +141,7 @@ erDiagram
   tenants ||--o{ audit_events : audit
 ```
 
-Key constraints and indexes (see `backend/internal/db/migrations/0001_init.sql`): unique `(job_id, scheduled_for)` for scheduled runs; unique `replay_of`; unique `(tenant_id, idempotency_key)` on jobs; unique `(run_id, attempt_number)`; partial indexes for due jobs, queued runs (by priority), expiring leases and due retries; tenant-scoped time indexes for history queries. All timestamps are `timestamptz` written in UTC.
+Key constraints and indexes (see `backend/taskflow/migrations/0001_init.sql`): unique `(job_id, scheduled_for)` for scheduled runs; unique `replay_of`; unique `(tenant_id, idempotency_key)` on jobs; unique `(run_id, attempt_number)`; partial indexes for due jobs, queued runs (by priority), expiring leases and due retries; tenant-scoped time indexes for history queries. All timestamps are `timestamptz` written in UTC.
 
 ## Security
 
@@ -159,7 +159,7 @@ Key constraints and indexes (see `backend/internal/db/migrations/0001_init.sql`)
 
 ## API
 
-REST under `/api/v1`, documented in **OpenAPI 3** (`backend/internal/api/openapi.yaml`, served at `/api/openapi.yaml`, Swagger UI at `/api/docs`). A contract test fails the build if a route is added without being documented. Responses use `{"data": …, "meta": {…}}`; errors use `{"error": {code, message, fields, request_id}}`. See [docs/api.md](docs/api.md) for conventions, examples and the endpoint list.
+REST under `/api/v1`, documented in **OpenAPI 3** generated by FastAPI (served at `/api/openapi.json`, Swagger UI at `/api/docs`). A route-contract test fails the build if any endpoint the frontend relies on disappears. Responses use `{"data": …, "meta": {…}}`; errors use `{"error": {code, message, fields, request_id}}`. See [docs/api.md](docs/api.md) for conventions, examples and the endpoint list.
 
 ## Run it locally
 
@@ -187,40 +187,40 @@ Common commands (`make help` lists all):
 | Metrics | `curl localhost:8081/metrics` (API; scheduler/workers expose `:9090/metrics` inside the network) |
 | Stop | `docker compose down` (add `-v` to delete data) |
 
-Running the Go services and Vite dev server directly (without Docker for the app) is described in [docs/deployment.md](docs/deployment.md#development-without-docker).
+Running the Python services and Vite dev server directly (without Docker for the app) is described in [docs/deployment.md](docs/deployment.md#development-without-docker).
 
 ## Testing
 
 | Layer | What | Command |
 |---|---|---|
-| Go unit | state machine (exhaustive transition table), cron/DST, missed-run planning, backoff, SSRF guard, handlers, password policy, redaction, rate limiter, config | `make test-backend` |
-| Go integration (real PostgreSQL + Redis) | concurrent claims, concurrent schedulers, fencing after lease loss, crash recovery, cancel/complete races, replay-once, concurrency limits, missed runs, overlap, tenant isolation, Redis outage fallback, reconciler after Redis data loss, graceful shutdown, drain, timeouts, panics, idempotent notifications, checkpoint resume, API auth/CSRF/RBAC/idempotency/validation/SSE, OpenAPI contract | `make test-deps && make test-integration` (runs with `-race`) |
+| Backend unit (pytest) | state machine (exhaustive transition table), cron/DST, DOM/DOW semantics, missed-run planning, backoff, SSRF guard (incl. DNS rebinding), handler payload validation, deterministic reports, route contract | `make test-backend` |
+| Backend integration (real PostgreSQL + Redis) | concurrent claims, concurrent schedulers, fencing after lease loss, crash recovery, cooperative cancel, replay-once under concurrency, per-job and workspace concurrency limits, tenant isolation, Redis publication + reconciler after a lost entry, Redis dispatch, worker concurrency bound, graceful shutdown, timeouts, handler crashes, idempotent notifications, checkpoint resume, API auth/CSRF/Origin/RBAC/idempotency/optimistic locking/strict decoding/rate limits/static serving/SSE | `make test-deps && make test-integration` |
 | Frontend unit | API client, formatting, components (permission-aware actions, timeline), login and job-form workflows (MSW) | `make test-frontend` |
 | End-to-end (Playwright) | register → create job → watch it execute → logs; recurring job pause/resume/cancel; DLQ replay + audit; viewer read-only; live updates; command palette; no horizontal overflow at 375/768/1366px; mobile drawer; dialogs fit small screens | `make up seed && make e2e` |
 | Failure drills | SIGKILL a busy worker; stop Redis; restart the scheduler twice | `make drills PASSWORD=<seed password>` |
 
-CI (`.github/workflows/ci.yml`) runs linting (gofmt, go vet, staticcheck, ESLint, Prettier, tsc), the race-enabled Go suite against PostgreSQL and Redis service containers, frontend tests and build, then brings up the Compose stack and runs Playwright and the failure drills against it.
+CI (`.github/workflows/ci.yml`) runs linting (ruff, ESLint, Prettier, tsc), the backend pytest suite against PostgreSQL and Redis service containers, frontend tests and build, then brings up the Compose stack and runs Playwright and the failure drills against it.
 
 ## Load testing
 
-`taskflow loadtest` submits jobs through the public API, waits for completion, then computes metrics from TaskFlow's own execution records (nothing is estimated):
+`python -m taskflow loadtest` submits jobs through the public API, waits for completion, then computes metrics from TaskFlow's own execution records (nothing is estimated):
 
 ```bash
 make loadtest PASSWORD=<seed password> JOBS=1000
-# or: go run ./cmd/taskflow loadtest -url http://localhost:8080 -email admin@example.com \
-#        -password … -jobs 1000 -concurrency 20 -duration-ms 50 -fail-rate 0.05 [-json]
+# or: python -m taskflow loadtest --url http://localhost:8080 --email admin@example.com \
+#        --password … --jobs 1000 --concurrency 20 --duration-ms 50 --fail-rate 0.05 [--json]
 ```
 
 It reports submission rate, end-to-end throughput, queue wait (attempt start − run queued) and execution latency percentiles, retries, failure rate and worker utilisation (busy worker-seconds ÷ available worker-seconds).
 
-**Measured results** (one laptop: Windows 11, Docker Engine in WSL2 with 12 vCPUs / ~4 GB RAM; every container on that host; `test.sleep` jobs of 50 ms, 5% simulated failure rate, 3 attempts):
+**Measured results** (one laptop: Windows 11, Docker Engine in WSL2 with 12 vCPUs / ~4 GB RAM; every container on that host; load generator inside the Compose network, through nginx; `test.sleep` jobs of 50 ms, 5% simulated failure rate, 3 attempts):
 
 | Workers × concurrency | Jobs | End-to-end throughput | Exec p50 / p95 | Retries | Failed jobs | Utilisation |
 |---|---|---|---|---|---|---|
-| 2 × 4 (8 slots) | 1,000 | 57.2 jobs/s | 64 / 76 ms | 58 | 0 | 53% |
-| 4 × 4 (16 slots) | 2,000 | 143.5 jobs/s | 67 / 91 ms | 96 | 0 | 71% |
+| 2 × 4 (8 slots) | 1,000 | 50.9 jobs/s | 72 / 120 ms | 60 | 0 | 59% |
+| 4 × 4 (16 slots) | 2,000 | 63.7 jobs/s | 88 / 211 ms | 107 | 0 | 47% |
 
-Queue wait is high in these runs by design: all jobs are submitted in ~2 s, far faster than 8–16 slots can drain 50 ms jobs. The numbers describe this machine only; reproduce them on yours with the command above. The load test also uncovered a real bug (a claim could skip a run that was momentarily row-locked right after publication, leaving it for the reconciler); with identical parameters, fixing it raised 2-worker throughput from 37.8 to 57.2 jobs/s and utilisation from 33% to 53% — see [docs/failure-scenarios.md](docs/failure-scenarios.md#found-by-testing).
+Queue wait is high in these runs by design: jobs are submitted faster than the slots can drain them. With 4 workers the limit is the single API process (~75 job submissions/s); run more API replicas to go further. The numbers describe this machine only; reproduce them on yours with the command above. The load test also found a real bottleneck: each worker claimed runs through one sequential loop, so claim latency (~30 ms under load) capped every worker below its slot count. Giving each slot its own claim loop — the concurrency bound is unchanged and covered by a test — raised 2-worker throughput from 31.9 to 50.9 jobs/s with identical parameters. See also [docs/failure-scenarios.md](docs/failure-scenarios.md#found-by-testing).
 
 ## Technology choices and trade-offs
 
@@ -228,7 +228,8 @@ Queue wait is high in these runs by design: all jobs are submitted in ~2 s, far 
 - **Redis as an accelerator** — a priority ZSET gives low-latency dispatch without N workers polling PostgreSQL, plus pub/sub for SSE and instant cancellation, and shared rate-limit counters. Because claims are verified in PostgreSQL, duplicate or lost Redis entries are harmless (duplicates fail to claim; lost entries are re-published). Redis Streams/consumer groups were not needed: PostgreSQL already provides the delivery state.
 - **Advisory-lock leader election** — the scheduler's leadership is tied to a PostgreSQL session, so a leader that loses its database connection loses leadership automatically. Correctness never depends on a single leader.
 - **Leases + fencing instead of locks held for the job's duration** — a dead worker's lease simply expires; a slow-but-alive worker is fenced out by attempt id.
-- **Single Go binary** for api/scheduler/worker/migrate/seed/loadtest — one image, one build, consistent code paths.
+- **One Python package, one image** for api/scheduler/worker/migrate/seed/loadtest (`python -m taskflow <command>`) — consistent code paths everywhere. Everything is `asyncio`: one process handles hundreds of concurrent requests, attempts, lease renewals and heartbeats without threads; CPU-bound password hashing runs in a bounded thread pool.
+- **Python over a compiled language** — readability and a smaller codebase, at the cost of per-process CPU throughput (the GIL keeps one process on one core). The design scales by adding processes (API replicas, workers), which the architecture already supports; PostgreSQL remains the real ceiling.
 - **No Kafka, Kubernetes or etcd** — none would add a guarantee this design lacks at this scale; Compose keeps the system runnable on a laptop.
 - **React Query + SSE** — events carry only ids; clients re-fetch through the normal authorised API, so the stream can never leak data and missed events self-heal.
 
@@ -262,21 +263,23 @@ Queue wait is high in these runs by design: all jobs are submitted in ~2 s, far 
 
 ```
 backend/
-  cmd/taskflow/          single binary: api | scheduler | worker | migrate | seed | loadtest | healthcheck
-  internal/
-    api/                 HTTP handlers, middleware, SSE hub, OpenAPI spec (+ contract test)
-    auth/                password hashing, tokens
-    service/             business logic (jobs, auth, ops/read models)
-    engine/              every lifecycle operation (schedule, claim, complete, recover, cancel, replay)
-    statemachine/        transition table, job-status derivation, action rules
-    store/               PostgreSQL repositories
-    schedule/            cron + timezone/DST evaluation, missed-run planning
-    retry/               backoff with jitter
-    queue/               Redis queue, deferred set, pub/sub
-    scheduler/  worker/  control loops and execution runtime
+  taskflow/
+    __main__.py          entry point: api | scheduler | worker | all-in-one | migrate | seed | loadtest | healthcheck
+    api/                 FastAPI app, ASGI middleware, SSE hub, static SPA serving, error envelopes
+    services/            business logic (jobs, auth, ops/read models)
+    engine.py            every lifecycle operation (schedule, claim, complete, recover, cancel, replay)
+    statemachine.py      transition table, job-status derivation, action rules
+    store/               PostgreSQL repositories (parameterised SQL, psycopg 3)
+    cron.py              cron + timezone/DST evaluation, missed-run planning
+    retry.py             backoff with jitter
+    queue.py             Redis queue, deferred set, pub/sub
+    scheduler.py         leader election and control loops
+    worker.py            execution runtime (slots, leases, cancellation, drain)
     handlers/            job-handler interface + built-in handlers
-    netguard/            SSRF-safe HTTP client
-    db/  config/  logging/  metrics/  ratelimit/  adminhttp/  testutil/
+    netguard.py          SSRF-safe outbound connections
+    migrations/          SQL schema
+    auth.py config.py db.py logs.py metrics.py ratelimit.py seed.py loadtest.py
+  tests/                 pytest: unit + integration (real PostgreSQL and Redis)
 frontend/
   src/components/ui/     design-system primitives      src/pages/   one folder per page
   src/api/  src/app/     data hooks, session/theme/live providers
